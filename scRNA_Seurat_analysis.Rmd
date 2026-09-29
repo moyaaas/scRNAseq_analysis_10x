@@ -1,0 +1,209 @@
+---
+title: "single cell"
+author: "Martina Montonati"
+date: "2025-09-09"
+output: html_document
+---
+
+Setting working directory and attaching libraries.
+```{r}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+```
+Our file:
+```{r}
+load("./SRA779509_SRS3805256.sparse.RData")
+```
+Rows are named by gene, but here they put together both the gene name symbol and the ENSEMBL ID.
+Renaming the rows of the table with just the gene symbol:
+```{r}
+sm@Dimnames[[1]] <- sub("[_].*","", sm@Dimnames[[1]])
+sm@Dimnames[[1]] <- make.unique(sm@Dimnames[[1]])
+```
+After changing the row names of the matrix, we can initialize the Seurat object:
+```{r}
+bm <- CreateSeuratObject(counts = sm, project = "BM", min.cells = 3, min.features = 200)
+bm
+```
+#Cell Quality Control
+Checking:
+- number of unique genes in each cell
+- number of reads detected within a cell
+- percentage of reads that map to mtDNA
+First we view rows with the name starting with MT
+```{r}
+grep("^MT-", rownames(bm), value = T)
+```
+Now we can calculare mitochondrial QC metrics with the *PercentageFeatureSet()* function, which calculates the percentage of counts originating from selected set of features(genes). The *pattern* field defines the criterion with which we select the genes by name: we saw that **mitochondrial genes** in our data start with "MT-" (^ is a starting symbol).
+```{r}
+bm[["percent.mt"]] <- PercentageFeatureSet(bm, pattern = "^MT-")
+```
+The [[]] operator can add columns to object metadata.
+
+We can do exactly the same with **ribosomial protein genes**. Their gene symbol usually starts by RPL or RPS:
+```{r}
+grep("^RP[LS]", rownames(bm), value = T)
+```
+And:
+```{r}
+bm[["percent.rbp"]] <- PercentageFeatureSet(bm, pattern = "^RP[LS]")
+```
+
+The number of **unique genes** (called here features) and **total molecules** (reads after UMI filtering) are automatically calculated after creating the Seurat Object. We can also see our new fantastic columns!
+```{r}
+head(bm@meta.data,5)
+```
+Visualize QC metrics as violin plots:
+```{r}
+VlnPlot(bm, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rbp"), ncol = 4)
+```
+Without dots:
+```{r}
+VlnPlot(bm, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rbp"), ncol = 4, pt.size = 0)
+```
+Checking if the parameters are correlated with one another. 
+*FeatureScatter()* is typically used to visualize feature-feature relationship, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores e tc.
+```{r}
+plot1 <- FeatureScatter(bm, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(bm, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+```{r}
+plot3 <- FeatureScatter(bm, feature1 = "nCount_RNA", feature2 = "percent.rbp")
+plot3
+```
+
+THe only visible correlation is between the overall number of reads and the number of genes detected in each cell: if we have low reads, we also have few genes, so problably the droplet was empty; and if we have too many reads and genes problably the droplet was a doublet.
+
+##QC thresholds
+```{r}
+bm <- subset(bm, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+bm
+```
+amount of cells removed?
+
+#Normalization
+```{r}
+bm <- NormalizeData(bm, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+Let us find  the normalized counts:
+```{r}
+bm@assays$RNA
+```
+Now that we have normalized the expression values, we can take a look to the genes that have the highest mean expression across our cells:
+```{r}
+apply(bm[["RNA"]]$counts,1,mean) -> gene.expression
+
+sort(gene.expression, decreasing = TRUE) -> gene.expression
+
+head(gene.expression, n=50)
+```
+Distribution of the expression of HBB and of another housekeeping gene:
+```{r}
+VlnPlot(bm, features = c("HBB","GAPDH"))
+```
+Seurat contains a pre-computed list of cell cycle specific genes, that can be used to guess which cell cycle phase each cell is in.
+```{r}
+CellCycleScoring(bm, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = TRUE) -> bm
+
+bm[[]]
+```
+
+#Feature Selection
+Each cell is a point in a n-dimension space, with n equal to the number of genes in the dataset. So each cell is a point with coordinates that represent the expression of each gene. However each cell has many genes with expression zero, so most of the coordinates will be zero. It is not so informative.
+The choice is to keep a subset of genes, that is, those with the greatest variability of expression across cells.
+Those are the ones that make the difference from one cell type to the other.
+
+The default method *vst* estimates the mean-variance reletionship of each gene, and chooses the 2000 genes with the highest variance. Then, we identify the 10 most highly variable genes, and plot variable features with and without labels.
+```{r}
+bm <- FindVariableFeatures(bm, selection.method = "vst", nfeatures = 2000)
+
+top10<- head(VariableFeatures(bm), 10)
+
+plot1 <- VariableFeaturePlot(bm)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = T)
+plot1 + plot2
+
+```
+#Scaling Counts
+We want to shift the expression of each gene, so that the mean expression across cells is 0 and the variance 1. 
+This step gives equal weight in downstream analyses, so highly-expressed genes do not dominate the choice of the dimension with the highest variability.
+- > 0 → high expression
+- = 0 → average expression
+- < 0 → under expression or no expressio at all
+```{r}
+all.genes <- rownames(bm)
+bm <- ScaleData(bm, features = all.genes, layer = "data")
+```
+Let us see the scaled values for a gene:
+```{r}
+bm@assays$RNA
+```
+#Dimensional Reduction
+Recommended method for 10x data is PCA.
+PCA is a mathematical method to reduce the dimensionality of data while keeping as much of the variation as possible.
+Each cell has expression values for thousands of genes, so each cell is a point in a very high-dimensional space... too many dimension to analyze.
+Many genes are correlated to each other.
+PCA finds a smaller set of new genes (called *principal components* PCs) that summarize most of the variability across cells.
+In the original space each of the dimensions was defined by a gene. For each PC we have *loadings* that are the correlation between the original variable and the principal component itself. Thus, they indicate how much each variable contributes to a specific PC.
+- positive loading → PC and variable positively correlated
+- negative loading → PC and variable negatively correlated
+Positive loadings correspond to driver genes for the choice of that component, that is , the ones with the highest variance contribution. 
+Among the genes output with highest loading for each PC there are genes known to be markers, or in any case with expression associated with the cell types we expected to find.
+```{r}
+bm <- RunPCA(bm, features= VariableFeatures(object = bm))
+print(bm[["pca"]], dims = 1:5, nfeatures = 5)
+```
+```{r}
+VizDimLoadings(bm, dims = 1:2, reduction = "pca")
+```
+And the projection of the cells in the first two PCs:
+```{r}
+DimPlot(bm, reduction = "pca")
+```
+The cells were colored according to the cell cycle phase: but they don't group by cell cycle phase.
+
+How many components should we choose to include?
+Computing how many PCs to keep based on the amount of variance they explain.
+```{r}
+pc.touse <- (bm$pca@stdev)^2 #std^2 so var for each PC
+pc.touse <- pc.touse/sum(pc.touse) #Normalizing by total var → now each PCs value equals to the fraction of var
+pc.touse <- cumsum(pc.touse)[1:50] #keeping the first 50,  take the cumulative sum
+pc.touse <- min(which(pc.touse>=0.75)) #find the first PC where cumulative var >= 75%
+pc.touse # minimum number of PCs needed to explain at least 75% of the variance
+```
+#Clustering
+kNN graph based on the euclidean distance in PCA space, connecting each node (cell) to the k nearest neighbors, and refines the edge weights between any two connected cells based on the shared overlap in their local neighborhoods
+This step is performed separately before the real clustering using the FindNeighbors() function, and takes as input the previously defined dimensionality of the dataset.By default, the “k” of kNN is set to 20.
+```{r}
+bm <- FindNeighbors(bm, dims = 1:17)
+```
+##Finding Clusters
+```{r}
+bm <- FindClusters(bm, resolution = 0.5)
+```
+Look at the cluster IDs of the first 5 cells.
+```{r}
+head(Idents(bm), 5)
+```
+```{r}
+head(bm[[]],5)
+```
+Clusters found: 14, from 0 to 13.
+We can plot them in the space of the first two PCA components.
+```{r}
+DimPlot(bm, reduction = "pca")
+```
+Better strategies for visualization and 2D plotting.
+```{r}
+bm <- RunTSNE(bm, dims = 1:13)
+DimPlot(bm, reduction = "tsne")
+```
+Or UMAP, that as of today is the preferred method
+```{r}
+reticulate::py_install(packages ='umap-learn')
+bm <- RunUMAP(bm, dims = 1:17)
+DimPlot((bm, reduction = "umap"))
+```
+We can also check whether some of the critical quality parameters influence the clustering we got

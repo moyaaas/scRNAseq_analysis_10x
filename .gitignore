@@ -1,0 +1,9 @@
+# R history and workspace files
+.RData
+*.RData
+.Rhistory
+.Ruserdata
+.Rproj.user/
+
+# Heavy data files
+*.sparse
